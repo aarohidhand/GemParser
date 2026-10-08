@@ -60,43 +60,7 @@ CUDA_VISIBLE_DEVICES=0 python extract_constraints_qwen_local.py \
     --llm_context_chars 120000
 ```
 
-### The setup we're sticking with
-
-```text
-GeM bid PDFs / linked documents
-            │
-            ▼
-     Existing v21 ingestion
-            │
-            ▼
-   Complete document bundle
-            │
-            ▼
-   Qwen3.8-27B — local GPU
-       4-bit NF4
-       BF16 compute
-       concurrency = 1
-            │
-            ▼
-    Agent 1 extraction
-            │
-            ▼
-       Anchoring
-            │
-            ▼
-       Risk router
-            │
-            ▼
-    Agent 2 validation
-            │
-            ▼
-       Finalizer
-            │
-            ▼
-   final_constraints.csv
-```
-
-The existing architecture is deliberately being left alone: the source describes the v21 design as a full-bundle Agent 1 extraction followed by targeted Agent 2 validation, rather than replacing the semantic pipeline with deterministic parsing. Pasted text
+the design is a full-bundle Agent 1 extraction followed by targeted Agent 2 validation, rather than replacing the semantic pipeline with deterministic parsing. Pasted text
 
 ### VRAM tuning
 
