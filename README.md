@@ -1,20 +1,3 @@
-Yes. The practical version is:
-
-- **Keep the current v21 semantic pipeline intact.**
-- **Use local Qwen3.8-27B with 4-bit NF4 + BF16 compute.**
-- **Load the model once and run inference serially.**
-- **Do not redesign the model interface unless the current loader actually fails.**
-- **First objective: get 10–20 real bids through the complete pipeline and inspect the resulting constraints.**
-- Only tune context size if there is an actual VRAM problem.
-
-### Files
-
-:chatgpt-content-reference{index="2"}[Download the modified local Transformers extractor](sandbox:/mnt/data/extract_constraints_qwen_local.py)
-
-requirements.txt[Download `requirements.txt`](sandbox:/mnt/data/requirements.txt)
-
-:chatgpt-content-reference{index="4"}[Download the Qwen GPU loading smoke test](sandbox:/mnt/data/test_qwen38_transformers.py)
-
 ### Setup
 
 Create an environment:
