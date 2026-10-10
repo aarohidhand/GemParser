@@ -1,0 +1,17 @@
+# Install PyTorch separately using the command in README.md for the target CUDA version.
+# These packages support the local Transformers backend and the document-ingestion pipeline.
+transformers>=5.0.0
+accelerate>=1.2.0
+bitsandbytes>=0.45.0
+safetensors>=0.4.5
+huggingface_hub>=0.27.0
+pillow>=10.0.0
+pymupdf>=1.24.0
+pdfplumber>=0.11.0
+pytesseract>=0.3.13
+python-docx>=1.1.2
+openpyxl>=3.1.5
+requests>=2.32.0
+tqdm>=4.66.0
+json-repair>=0.30.0
+openai>=1.60.0
