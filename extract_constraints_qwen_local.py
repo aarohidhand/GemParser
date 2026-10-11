@@ -1143,6 +1143,36 @@ Schema:
   ]
 }
 
+SEARCH QUERY RULES (INDIAMART):
+
+Generate `indiamart_search_query` as a practical product-discovery query for finding
+matching products and suppliers on IndiaMART. This field is not a summary of the bid
+and must not be a dump of every extracted constraint.
+
+- Start with the actual product name/category and its common commercial name.
+- Prioritize explicitly marked golden parameters because they are strong matching
+  signals, but do NOT rely on golden_param alone: include other explicit, highly
+  discriminative specifications even when golden_param=false.
+- Prefer a small set of identifying details, such as material/grade, model or part
+  number, dimensions, capacity, size, colour, finish, or a technical standard, when
+  those details materially distinguish the requested item. Select only details that
+  apply to the same product/configuration.
+- For multiple distinct products, BOQ items, or configurations, do not combine their
+  incompatible specifications into one query. Use the primary purchasable product
+  for this single query; do not invent a query for a configuration that is not clear.
+- Exclude generic GeM/bid administration, buyer identity/contact details, bid number,
+  submission instructions, payment clauses, delivery deadlines, and other transaction
+  terms unless a term directly helps identify the product being searched for.
+- Do not add inferred brands, model numbers, certifications, materials, dimensions,
+  or performance values that are not supported by the documents. Do not include a
+  certification merely because it appears somewhere in the bid if it is unrelated to
+  the product's identity.
+- Use concise keyword-style phrasing suitable for a marketplace search, not a full
+  sentence. Avoid vague filler such as "best quality", "required", or "as per tender".
+- If the documents do not identify a searchable product with reasonable confidence,
+  return null rather than fabricate a query.
+- Keep `product_name`, `product_category`, and `indiamart_search_query` consistent.
+
 EXTRACTION RULES:
 
 1. Extract all substantive evidence-backed buyer/product/supplier/transaction
@@ -1270,6 +1300,14 @@ IMPORTANT CHUNK RULES:
   product specification unless the text explicitly applies it to the product/group.
 - Do not merge distinct physical instances into one group merely because they share
   an attribute.
+- Generate `indiamart_search_query` as a concise marketplace product-discovery query:
+  product name/category first, then explicitly marked golden parameters, then other
+  explicit and highly discriminative specifications even if they are not golden.
+  Use only specs belonging to the same product/configuration. Exclude generic GeM/bid
+  administration and transaction terms unless they directly identify the product.
+  Never invent brands, models, standards, dimensions, or values. For a chunk that does
+  not contain enough product identity to form a reliable query, return null for this
+  field; do not construct a query from unrelated items.
 
 Return JSON only in this exact top-level shape:
 {
