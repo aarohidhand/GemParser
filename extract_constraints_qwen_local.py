@@ -2835,7 +2835,16 @@ async def process_bid(pool, client, sem, pdf: Path, args, out_dir: Path,
                 if gate not in ingestion_warnings:
                     ingestion_warnings.append(gate)
         all_flags.extend(ingestion_warnings)
-        status="failed" if failed_documents else "ok"
+        # A failed optional linked-document download is an ingestion warning, not
+        # an extraction failure when the main bid was parsed and constraints were
+        # successfully produced. Keep failed_documents/representation_flags for
+        # auditability; reserve status="failed" for an unusable extraction.
+        status = "ok" if final_constraints else "failed"
+        if failed_documents and final_constraints:
+            all_flags.append(
+                f"partial_ingestion: {len(failed_documents)} linked document(s) could not be retrieved or processed; "
+                "main-bid extraction completed"
+            )
         (bid_folder/"extraction.json").write_text(json.dumps({"schema_version":30,"agent":"qwen_constraint_extractor","bid_id":bid_id,"constraints":extraction_constraints},indent=2,ensure_ascii=False),encoding="utf-8")
         (bid_folder/"chunk_extractions.json").write_text(json.dumps({
             "schema_version":30,
