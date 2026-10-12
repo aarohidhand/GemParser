@@ -919,67 +919,6 @@ def load_linked_spec_documents(
 # -----------------------------------------------------------------------------
 # Safe prompt templating: the JSON schemas inside the prompts contain literal
 # braces, so str.format() is intentionally NOT used for LLM prompts.
-LLM_COMPACT_RETRY_PROMPT = """Reconstruct the complete buyer requirement representation
-from the CURRENT DOCUMENT SET below.
-
-This is a retry because the previous response was not valid JSON.
-
-Rules:
-- output ONE JSON object only
-- use compact JSON
-- no markdown
-- no <think>
-- no explanation
-- preserve every substantive requirement
-- preserve correlations between specifications belonging to the same physical item
-- NEVER flatten separate physical/configuration instances into allowed_values
-- raw_text <= 240 characters
-- do not invent values
-
-Top-level schema:
-{
-  "product_name": null,
-  "product_category": null,
-  "indiamart_search_query": null,
-  "requirement_groups": [],
-  "contacts": [],
-  "office_name": null,
-  "golden_candidates": [],
-  "linked_document_mentions": []
-}
-
-Each requirement group:
-{
-  "requirement_group_id": "...",
-  "requirement_group_type": "product|component|spares|service|supplier|transaction|document|other",
-  "requirement_description": "...",
-  "line_item_id": null,
-  "source_document_id": "MAIN_BID|DOC_01|DOC_02",
-  "constraints": []
-}
-
-Each constraint:
-{
-  "category": "PRODUCT|TECHNICAL|QUALITY|CAPACITY|DELIVERY|COMMERCIAL|CERTIFICATION|SUPPLIER|GEOGRAPHY|DOCUMENT|OTHER",
-  "scope": "product|supplier|transaction",
-  "constraint_type": "...",
-  "attribute": "...",
-  "spec_name": null,
-  "operator": "=|>=|<=|>|<|in|required|prohibited|conditional|other",
-  "buyer_value": null,
-  "allowed_values": null,
-  "allows_higher": false,
-  "unit": null,
-  "condition": null,
-  "status": "specified|conditional|unspecified|not_applicable",
-  "golden_param": false,
-  "raw_text": "...",
-  "confidence": 0.0
-}
-
-CURRENT DOCUMENT SET:
-{source_bundle}
-"""
 
 def render_prompt(template: str, **values) -> str:
     out = template
@@ -1018,13 +957,11 @@ class RateLimiter:
 #
 # Architecture:
 #   1. Parse/download documents only to obtain complete document text and links.
-#   2. Give Qwen the COMPLETE current document set for a bid.
-#   3. After each newly discovered linked document, RE-TRACE the entire current
-#      document set with Qwen. The model must reconstruct the complete
-#      requirement representation, not patch/append isolated constraints.
-#   4. The final pass over all successfully parsed documents is the sole source
-#      of final semantic constraints.
-#   5. Python performs only mechanical validation/deduplication/ID assignment.
+#   2. Agent 1 extracts from the complete bundle (or chunks only when context
+#      limits require it); there is no document-triage or model-repair stage.
+#   3. Agent 2 performs one consolidated validation call for routed constraints.
+#   4. Python performs deterministic parsing, deduplication, evidence attachment,
+#      and validation bookkeeping without extra LLM prompts.
 #
 # There is deliberately NO deterministic table->constraint parser in this path.
 # PDF/XLSX table extraction is used only as document-text extraction.
@@ -1173,6 +1110,8 @@ and must not be a dump of every extracted constraint.
   return null rather than fabricate a query.
 - Keep `product_name`, `product_category`, and `indiamart_search_query` consistent.
 
+
+
 EXTRACTION RULES:
 
 1. Extract all substantive evidence-backed buyer/product/supplier/transaction
@@ -1227,6 +1166,16 @@ EXTRACTION RULES:
 16. The final representation must be internally consistent: every product constraint
     belongs to a requirement group; correlated specifications for one physical item
     must share the same group ID.
+
+**Certificate and Yes/No Field Handling**
+
+When extracting certificate-related requirements, distinguish between a certificate being mandatory, not mandatory, unavailable, or merely mentioned in a form.
+
+- Do not infer that a certificate is required simply because a field contains the words "certificate", "required", or "No".
+- Interpret values such as "Yes", "No", blank fields, asterisks, and form defaults in the context of the surrounding source text.
+- A source entry such as "Type Test Certificate - * No" must not automatically be converted into a mandatory certificate requirement. If the meaning is ambiguous, preserve the exact source text and mark the requirement as `UNCLEAR`.
+- Mark a certificate as mandatory only when the source explicitly supports that interpretation.
+- Do not invent or infer certificate obligations to fill gaps. When uncertain, retain the extracted field but flag its status as unresolved.
 
 CURRENT DOCUMENT SET:
 {source_bundle}
@@ -1296,6 +1245,10 @@ IMPORTANT CHUNK RULES:
   eligibility.
 - Preserve exact numbers, ranges, units, grades, standards, model/part numbers,
   quantities, durations, percentages and conditions.
+- TECHNICAL TABLE COMPLETENESS IS REQUIRED: inspect every row of every technical/specification table in the supplied text. Emit a separate constraint for each explicit product attribute/value, including size, cores, material, shape, insulation, sheath, standards, certifications, marking, test reports, and packaging/length where present. Do not stop after extracting the first row.
+- For tables with both “Values” and “Bid Requirement (Allowed Values)”, preserve the distinction: the buyer requirement column controls the requirement; the Values column is the catalog/category value. Capture allowed alternatives only as allowed_values for that same attribute.
+- Give each product a descriptive group ID based on the actual product (e.g. CABLE_01 for cable, not CRANE_01).
+- Every constraint must carry a short exact raw_text excerpt from its source. Never return a constraint with no evidence excerpt when source text is available.
 - Do not reinterpret project/plant/building/capacity/budget/schedule context as a
   product specification unless the text explicitly applies it to the product/group.
 - Do not merge distinct physical instances into one group merely because they share
@@ -1356,6 +1309,20 @@ CHUNK METADATA:
 
 CHUNK TEXT:
 {source_bundle}
+"""
+
+
+LLM_MISSING_SPEC_RECOVERY_PROMPT = """You are recovering technical specifications omitted from an earlier extraction.
+Return only constraints supported by the supplied source rows. Do not repeat constraints already extracted.
+For each row, preserve the distinction between the catalog “Values” and buyer “Bid Requirement (Allowed Values)” columns. The buyer requirement column is the requirement; preserve alternatives only for that same attribute.
+Use the product's actual descriptive group ID (for example CABLE_01 for a cable), never an unrelated product label. Include exact evidence in raw_text, source_document_id, attribute, buyer_value, unit, allowed_values, status, and golden_param only when explicitly supported.
+Return JSON only in this shape: {"schema_version":30,"product_name":null,"product_category":null,"indiamart_search_query":null,"requirement_groups":[{"requirement_group_id":"CABLE_01","requirement_group_type":"product","requirement_description":"Submersible cable","line_item_id":null,"source_document_id":"MAIN_BID","constraints":[]}],"contacts":[],"office_name":null,"golden_candidates":[],"linked_document_mentions":[]}
+
+ALREADY EXTRACTED CONSTRAINTS (do not repeat):
+{existing_constraints}
+
+MISSING SOURCE SPECIFICATION ROWS:
+{missing_rows}
 """
 
 
@@ -1455,37 +1422,6 @@ JSON1 BATCH:
 {extracted_json}
 """
 
-LLM_VALIDATOR_REPAIR_PROMPT = """Repair the following validator output into ONE valid JSON object.
-Do NOT add, remove, or semantically alter validation decisions. Preserve every constraint_id and
-KEEP/CORRECT/REJECT decision. Do not invent evidence or source text. Output JSON only.
-Required fields: schema_version, validation_agent, validation_status, summary, validated_constraints.
-Each decision requires constraint_id, decision, original_constraint, validated_constraint, evidence, reason, validation_confidence.
-
-MODEL OUTPUT:
-{text}
-"""
-
-LLM_REPAIR_PROMPT = """Repair the following model output into ONE valid JSON object for the
-requirement-group procurement extraction schema.
-
-Do NOT add facts or change values. Preserve requirement groups and their relationships.
-Do NOT flatten separate physical/configuration instances into allowed_values.
-The top-level object must contain product_name, product_category, indiamart_search_query,
-requirement_groups, contacts, office_name, golden_candidates, and linked_document_mentions.
-
-Each requirement group must contain:
-requirement_group_id, requirement_group_type, requirement_description, line_item_id, constraints.
-
-Each constraint must contain:
-category, scope, constraint_type, attribute, spec_name, operator, buyer_value,
-allowed_values, allows_higher, unit, condition, status, golden_param,
-source_document, source_document_id, raw_text, confidence.
-
-Output JSON only.
-
-MODEL OUTPUT:
-{text}
-"""
 
 def render_prompt(template: str, **values) -> str:
     out = template
@@ -1683,6 +1619,18 @@ async def call_llm(client, model, sem, prompt, max_tokens, think_mode,
 
 
 
+LLM_JSON_REPAIR_PROMPT = """Repair the malformed JSON below into one valid JSON object.
+Preserve the original data and values exactly; do not add, remove, infer, summarize, or semantically correct fields. Fix serialization syntax only. Return only the repaired JSON object, with no markdown fences or commentary.
+
+MALFORMED_JSON:
+{malformed_json}
+"""
+
+
+class JSONRepairFailed(RuntimeError):
+    """A model response remained invalid after its single JSON-repair attempt."""
+
+
 def parse_llm_json(text: str):
     """
     Parse Qwen JSON defensively:
@@ -1734,35 +1682,31 @@ def parse_llm_json(text: str):
 
 
 async def parse_or_repair_llm_json(
-    client,
-    model,
-    sem,
-    raw,
-    max_tokens,
-    think_mode,
-    rate_limiter=None,
-    api_budget=None,
+    client, model, sem, raw, max_tokens, think_mode,
+    rate_limiter=None, api_budget=None,
 ):
-    """Parse JSON with local syntax repair only.
+    """Parse strictly first; call the JSON-repair prompt only for invalid JSON.
 
-    We intentionally do not spend another API request trying to repair malformed
-    JSON. If the response is malformed, the caller performs one fresh semantic
-    reconstruction over the COMPLETE document set. This avoids wasting the free
-    endpoint quota on a second prompt that contains the model's own broken output.
+    If the one repair attempt is still invalid, raise JSONRepairFailed so the
+    current bid is marked failed and processing continues with the next bid.
     """
-    return parse_llm_json(raw)
+    try:
+        return parse_llm_json(raw)
+    except Exception as parse_error:
+        if client is None:
+            raise JSONRepairFailed(f"Invalid JSON and no LLM client available for repair: {parse_error}") from parse_error
+        repair_prompt = render_prompt(LLM_JSON_REPAIR_PROMPT, malformed_json=str(raw)[:100000])
+        try:
+            repaired_raw = await call_llm(
+                client, model, sem, repair_prompt, max_tokens, think_mode,
+                rate_limiter=rate_limiter, api_budget=api_budget, retries=1,
+            )
+            return parse_llm_json(repaired_raw)
+        except Exception as repair_error:
+            raise JSONRepairFailed(
+                f"JSON invalid; single repair attempt failed. Original={parse_error!r}; repair={repair_error!r}"
+            ) from repair_error
 
-
-DOCUMENT_TRIAGE_PROMPT = """You are a document triage agent for a product/supplier matching dataset.
-For each linked document, decide whether it contains useful product, technical, BOQ, or supplier-eligibility constraints.
-INCLUDE technical specifications, product datasheets, buyer requirements, BOQs, drawings, supplier qualification/certification requirements.
-SKIP general SLA/terms-and-conditions, contract boilerplate, payment/penalty/indemnity clauses, generic instructions, declarations, and administrative forms.
-If the opening text is empty, corrupted, or consists mostly of page markers, do NOT infer that the document is irrelevant: choose INCLUDE because the content is unknown.
-Filename and link context are evidence. If filename clearly says technical/bid specification or datasheet, INCLUDE. If it clearly says SLA/general terms and conditions, SKIP unless there is strong evidence it is also a technical specification.
-Do not skip MAIN_BID. Return only JSON: {"documents":[{"document_id":"DOC_01","decision":"INCLUDE","reason":"short reason"}]}
-DOCUMENTS:
-{document_summaries}
-"""
 
 TECHNICAL_DOC_RE = re.compile(
     r"(?:technical|tech)[ _-]*(?:spec|specification|requirement|data[ _-]*sheet)|"
@@ -1775,80 +1719,6 @@ ADMIN_DOC_RE = re.compile(
     r"agreement|contract|undertaking|declaration|integrity[ _-]*pact|payment[ _-]*terms?|"
     r"penalt(?:y|ies)|service[ _-]*level)(?:[ _.-]|$)", re.I
 )
-
-
-def deterministic_document_triage(d):
-    """Conservative filename/context gate. Returns a decision only for clear cases."""
-    if d.get("document_id") == "MAIN_BID":
-        return "INCLUDE", "main bid is always retained"
-    filename = str(d.get("source_document") or "")
-    context = str(d.get("link_context") or "")
-    text = str(d.get("text") or "")[:2600]
-    name_context = f"{filename} {context}"
-    compact_text = re.sub(r"[\W_]+", " ", text, flags=re.UNICODE).strip().lower()
-    text_is_unusable = len(compact_text) < 80 or len(re.findall(r"\b(?:page|sheet|document)\s*\d*\b", compact_text)) > max(3, len(compact_text.split()) // 4)
-    if TECHNICAL_DOC_RE.search(name_context):
-        return "INCLUDE", "filename/link context identifies a technical specification or product requirement; retained even though opening text may be sparse"
-    if ADMIN_DOC_RE.search(filename) and not TECHNICAL_DOC_RE.search(name_context):
-        return "SKIP", "filename identifies general SLA/terms/contract or administrative material, not a product specification"
-    if text_is_unusable:
-        return "INCLUDE", "opening text is empty or unreliable; fail-safe include rather than discard a potentially important specification"
-    return None, None
-
-
-async def triage_documents(client, model, sem, documents, args, rate_limiter=None, api_budget=None):
-    """Apply deterministic filename gates first, then use the LLM only for ambiguous openings."""
-    active=[]
-    audit=[]
-    ambiguous=[]
-    for d in documents:
-        decision, reason = deterministic_document_triage(d)
-        if decision is None:
-            ambiguous.append(d)
-        else:
-            d["triage_decision"], d["triage_reason"] = decision, reason
-            audit.append({"document_id":d.get("document_id"),"source_document":d.get("source_document"),"decision":decision,"reason":reason,"method":"deterministic_filename_context_gate","opening_chars_reviewed":min(2600,len(d.get("text") or ""))})
-            if decision == "INCLUDE": active.append(d)
-            else: print(f"    [DOC TRIAGE] SKIP {d.get('document_id')}: {d.get('source_document')} — {reason}", file=sys.stderr)
-    if ambiguous and client and not getattr(args, "no_doc_triage", False):
-        summaries=[]
-        for d in ambiguous:
-            summaries.append({"document_id":d.get("document_id"),"source_document":d.get("source_document"),"link_context":d.get("link_context"),"opening_chars":(d.get("text") or "")[:2600]})
-        prompt=render_prompt(DOCUMENT_TRIAGE_PROMPT, document_summaries=json.dumps(summaries,ensure_ascii=False))
-        try:
-            raw=await call_llm(client, model, sem, prompt, min(args.max_new_tokens,1800), args.no_think_mode, rate_limiter=rate_limiter, api_budget=api_budget, retries=3)
-            obj=parse_llm_json(raw)
-            decisions={str(x.get("document_id")):x for x in obj.get("documents",[]) if isinstance(x,dict)}
-            for d in ambiguous:
-                row=decisions.get(str(d.get("document_id")),{})
-                decision=str(row.get("decision") or "INCLUDE").upper().strip()
-                if decision not in {"INCLUDE","SKIP"}: decision="INCLUDE"
-                reason=clean(str(row.get("reason") or "missing/uncertain decision; included by default"))
-                # Model must not discard documents whose opening text is unreadable.
-                text=(d.get("text") or "")[:2600]
-                if len(re.sub(r"[\W_]+", " ", text).strip()) < 80:
-                    decision="INCLUDE"
-                    reason="opening text is empty/unreliable; model skip overridden to protect potentially important content"
-                d["triage_decision"],d["triage_reason"]=decision,reason
-                audit.append({"document_id":d.get("document_id"),"source_document":d.get("source_document"),"decision":decision,"reason":reason,"method":"llm_opening_text","opening_chars_reviewed":min(2600,len(d.get("text") or ""))})
-                if decision == "INCLUDE": active.append(d)
-                else: print(f"    [DOC TRIAGE] SKIP {d.get('document_id')}: {d.get('source_document')} — {reason}",file=sys.stderr)
-        except Exception as e:
-            for d in ambiguous:
-                d["triage_decision"]="INCLUDE"; d["triage_reason"]=f"triage API failed; included by default ({type(e).__name__})"; active.append(d)
-                audit.append({"document_id":d.get("document_id"),"source_document":d.get("source_document"),"decision":"INCLUDE","reason":"triage API failed; fail-open","method":"fail_safe"})
-            print(f"  [DOC TRIAGE] API failed; included {len(ambiguous)} ambiguous docs by default: {e!r}",file=sys.stderr)
-    else:
-        for d in ambiguous:
-            d["triage_decision"]="INCLUDE"; d["triage_reason"]="triage disabled/unavailable; included by default"
-            active.append(d)
-            audit.append({"document_id":d.get("document_id"),"source_document":d.get("source_document"),"decision":"INCLUDE","reason":d["triage_reason"],"method":"fail_safe"})
-    # Keep document order stable for reproducible chunking.
-    active_ids={id(d) for d in active}
-    active=[d for d in documents if id(d) in active_ids]
-    print(f"  [DOC TRIAGE] included {len(active)}/{len(documents)} documents; excluded {len(documents)-len(active)}",file=sys.stderr)
-    return active,audit
-
 
 
 def build_document_sections(parsed: dict, linked_docs: list) -> list:
@@ -2407,7 +2277,10 @@ async def run_validator_batch(client, model, sem, evidence_bundle, inputs, max_t
         extracted_json=json.dumps(inputs,ensure_ascii=False,separators=(",",":")))
     raw=await call_llm(client,model,sem,prompt,max_tokens,think_mode,
                        rate_limiter=rate_limiter,api_budget=api_budget,retries=retries)
-    obj=parse_llm_json(raw)
+    obj=await parse_or_repair_llm_json(
+        client,model,sem,raw,max_tokens,think_mode,
+        rate_limiter=rate_limiter,api_budget=api_budget,
+    )
     errors=validate_validator_object(obj,inputs)
     if errors:
         raise ValueError("validator structural validation failed: "+" | ".join(errors))
@@ -2430,6 +2303,8 @@ async def validate_in_batches(client, model, sem, documents, inputs, batch_size,
                                           rate_limiter=rate_limiter,api_budget=api_budget,retries=retries)
             batch_records.append({"batch":label,"input_count":len(items),"status":"ok","evidence_chars":len(evidence)})
             all_items.extend(obj.get("validated_constraints",[])); return
+        except JSONRepairFailed:
+            raise
         except Exception as first_error:
             # v30: never recursively split a failed Agent-2 batch. Recursive
             # splitting was the source of dozens of extra calls on free endpoints.
@@ -2709,15 +2584,20 @@ async def process_bid(pool, client, sem, pdf: Path, args, out_dir: Path,
         documents=[{"document_id":"MAIN_BID","source_kind":"main_bid","source_document":parsed.get("source_document") or pdf.name,"text":parsed.get("full_text","") or "",
                      "page_count":parsed.get("page_count"),"ocr_pages":parsed.get("ocr_pages",0),"ocr_attempted_pages":parsed.get("ocr_attempted_pages",0),"ocr_successful_pages":parsed.get("ocr_successful_pages",0),
                      "native_text_chars":parsed.get("native_text_chars"),"extracted_text_chars":parsed.get("extracted_text_chars"),
-                     "ingestion_warnings":parsed.get("ingestion_warnings",[]),"ocr_errors":parsed.get("ocr_errors",[]),"page_quality":parsed.get("page_quality",[])}]
+                     "ingestion_warnings":parsed.get("ingestion_warnings",[]),"ocr_errors":parsed.get("ocr_errors",[]),"page_quality":parsed.get("page_quality",[]),"spec_rows":parsed.get("spec_rows",[])}]
         for i,d in enumerate(linked_docs,1):
             documents.append({"document_id":f"DOC_{i:02d}","source_kind":"linked_document","source_document":d.get("source_document") or f"linked_document_{i}","text":d.get("full_text","") or "","linked_from":d.get("linked_from"),"link_context":d.get("link_context"),"local_path":d.get("local_path"),
                 "page_count":d.get("page_count"),"ocr_pages":d.get("ocr_pages",0),"ocr_attempted_pages":d.get("ocr_attempted_pages",0),"ocr_successful_pages":d.get("ocr_successful_pages",0),"native_text_chars":d.get("native_text_chars"),
-                "extracted_text_chars":d.get("extracted_text_chars"),"ingestion_warnings":d.get("ingestion_warnings",[]),"ocr_errors":d.get("ocr_errors",[]),"page_quality":d.get("page_quality",[])})
+                "extracted_text_chars":d.get("extracted_text_chars"),"ingestion_warnings":d.get("ingestion_warnings",[]),"ocr_errors":d.get("ocr_errors",[]),"page_quality":d.get("page_quality",[]),"spec_rows":d.get("spec_rows",[])})
         if not client: raise RuntimeError("v25 requires the LLM for final semantic constraints. Use --no_llm only for ingestion/testing.")
         all_documents = documents
-        documents, triage_audit = await triage_documents(client, args.model, sem, all_documents, args,
-                                                          rate_limiter=rate_limiter, api_budget=api_budget)
+        # Prompt budget policy: no separate document-triage LLM call. Include all
+        # successfully parsed documents and let Agent 1 classify relevant content.
+        documents = all_documents
+        triage_audit = [{"document_id": d.get("document_id"),
+                         "source_document": d.get("source_document"),
+                         "decision": "INCLUDE", "reason": "LLM triage removed; Agent 1 handles relevance",
+                         "method": "no_llm_triage"} for d in documents]
         # Quality-gate only documents selected for semantic extraction. Full ingestion
         # diagnostics and triage decisions for every document remain in the manifest.
         # If a technical PDF is badly truncated, continue extracting what is available.
@@ -2758,14 +2638,13 @@ async def process_bid(pool, client, sem, pdf: Path, args, out_dir: Path,
             print(f"    [AGENT1 {chunk['chunk_id']}] {chunk['chars']:,} chars | docs={','.join(chunk['documents'])}",file=sys.stderr)
             try:
                 raw=await call_llm(client,args.model,sem,prompt,args.max_new_tokens,args.no_think_mode,rate_limiter=rate_limiter,api_budget=api_budget)
-                try:
-                    obj=parse_llm_json(raw)
-                except Exception as e1:
-                    print(f"    [JSON retry] {bid_id} {chunk['chunk_id']}: {e1}",file=sys.stderr)
-                    retry_prompt = prompt + "\n\nReturn ONLY valid JSON. No markdown, no explanation."
-                    raw2=await call_llm(client,args.model,sem,retry_prompt,args.max_new_tokens,args.no_think_mode,rate_limiter=rate_limiter,api_budget=api_budget)
-                    obj=parse_llm_json(raw2)
+                obj=await parse_or_repair_llm_json(
+                    client,args.model,sem,raw,args.max_new_tokens,args.no_think_mode,
+                    rate_limiter=rate_limiter,api_budget=api_budget,
+                )
                 chunk_objects.append({"chunk":chunk,"object":obj})
+            except JSONRepairFailed:
+                raise
             except Exception as e:
                 chunk_failures.append({"chunk_id":chunk["chunk_id"],"error":repr(e),"documents":chunk["documents"]})
                 print(f"    [CHUNK FAILED] {bid_id} {chunk['chunk_id']}: {e!r}",file=sys.stderr)
@@ -2789,6 +2668,57 @@ async def process_bid(pool, client, sem, pdf: Path, args, out_dir: Path,
                 c["_extraction_chunk_id"]=chunk["chunk_id"]
                 c["_chunk_parts"]=chunk["parts"]
                 raw_constraints.append(c)
+
+        # Deterministic technical-table completeness audit. If parsed table rows were
+        # missed by Agent 1, make exactly one targeted recovery call for those rows.
+        expected_rows = []
+        for d in documents:
+            for row in d.get("spec_rows", []) or []:
+                name = clean(str(row.get("name") or ""))
+                value = clean(str(row.get("value") or ""))
+                allowed = clean(str(row.get("allowed_raw") or ""))
+                if name and (value or allowed) and value not in {"-", "—", "NA", "N/A"}:
+                    expected_rows.append({"source_document_id": d.get("document_id"), "source_document": d.get("source_document"),
+                        "group": row.get("group"), "attribute": name, "catalog_value": value,
+                        "buyer_requirement_allowed_values": allowed, "golden_param": bool(row.get("golden")),
+                        "raw_text": f"{name}: Values={value}; Bid Requirement (Allowed Values)={allowed}"[:500]})
+        def norm_spec(v):
+            return re.sub(r"[^a-z0-9]+", "", str(v or "").casefold())
+        def row_is_covered(row, constraints):
+            row_name = norm_spec(row.get("attribute"))
+            for c in constraints:
+                names = {norm_spec(c.get("attribute")), norm_spec(c.get("spec_name"))}
+                raw = norm_spec(c.get("raw_text"))
+                if row_name and (row_name in names or (len(row_name) >= 5 and row_name in raw)):
+                    return True
+            return False
+        missing_rows = [r for r in expected_rows if not row_is_covered(r, raw_constraints)]
+        completeness_audit = {"parsed_spec_rows": len(expected_rows), "initial_constraints": len(raw_constraints),
+                              "missing_spec_rows_before_recovery": len(missing_rows), "recovery_attempted": False, "recovered_constraints": 0}
+        if missing_rows and not args.no_llm and client:
+            # Bound the recovery payload: one compact call with only missing table rows.
+            completeness_audit["recovery_attempted"] = True
+            print(f"  [COVERAGE] {bid_id} | {len(missing_rows)}/{len(expected_rows)} parsed spec rows missing; one targeted recovery call", file=sys.stderr)
+            recovery_prompt = render_prompt(LLM_MISSING_SPEC_RECOVERY_PROMPT,
+                existing_constraints=json.dumps(raw_constraints, ensure_ascii=False)[:18000],
+                missing_rows=json.dumps(missing_rows, ensure_ascii=False)[:24000])
+            try:
+                recovery_raw = await call_llm(client, args.model, sem, recovery_prompt,
+                    min(args.max_new_tokens, 8192), args.no_think_mode, rate_limiter=rate_limiter, api_budget=api_budget)
+                recovery_obj = await parse_or_repair_llm_json(client, args.model, sem, recovery_raw,
+                    min(args.max_new_tokens, 8192), args.no_think_mode, rate_limiter=rate_limiter, api_budget=api_budget)
+                recovered = flatten_qwen_groups(recovery_obj)
+                recovered = [c for c in recovered if not row_is_covered({"attribute": c.get("spec_name") or c.get("attribute")}, raw_constraints)]
+                for c in recovered:
+                    c["_extraction_chunk_id"] = "TARGETED_SPEC_RECOVERY"
+                    raw_constraints.append(c)
+                completeness_audit["recovered_constraints"] = len(recovered)
+                completeness_audit["missing_spec_rows_after_recovery"] = sum(1 for r in expected_rows if not row_is_covered(r, raw_constraints))
+            except Exception as e:
+                completeness_audit["recovery_error"] = repr(e)
+                completeness_audit["missing_spec_rows_after_recovery"] = len(missing_rows)
+        else:
+            completeness_audit["missing_spec_rows_after_recovery"] = len(missing_rows)
 
         # Use the first metadata-bearing extraction for bid-level fields, preferring
         # non-null values across chunks rather than requiring one chunk to contain all metadata.
@@ -2858,11 +2788,11 @@ async def process_bid(pool, client, sem, pdf: Path, args, out_dir: Path,
             validation_status="ok"; final_constraints=extraction_constraints
             validation_audit=[{"constraint_id":str(c.get("constraint_id")),"decision":"KEEP","route":"auto_keep","reason":"low-risk explicit constraint"} for c in extraction_constraints]
         else:
-            print(f"  [AGENT2] {bid_id} | {len(risky_constraints)}/{len(extraction_constraints)} high-risk constraints | targeted evidence | batch={args.validator_batch_size}",file=sys.stderr)
+            print(f"  [AGENT2] {bid_id} | one validation call for {len(risky_constraints)}/{len(extraction_constraints)} high-risk constraints",file=sys.stderr)
             validation_obj,agent2_audit=await validate_in_batches(client,args.model,sem,documents,risky_constraints,
-                batch_size=args.validator_batch_size,min_batch_size=args.validator_min_batch_size,
+                batch_size=max(1, len(risky_constraints)),min_batch_size=max(1, len(risky_constraints)),
                 max_tokens=args.validator_max_new_tokens or args.max_new_tokens,think_mode=args.no_think_mode,
-                rate_limiter=rate_limiter,api_budget=api_budget,retries=args.validator_retries,
+                rate_limiter=rate_limiter,api_budget=api_budget,retries=1,
                 evidence_chars=args.validator_evidence_chars,evidence_window=args.validator_evidence_window)
             validated_high,_=apply_validation(risky_constraints,validation_obj)
             validated_by_id={str(c.get("constraint_id")):c for c in validated_high}
@@ -2952,7 +2882,7 @@ async def process_bid(pool, client, sem, pdf: Path, args, out_dir: Path,
         },indent=2,ensure_ascii=False),encoding="utf-8")
         result={"schema_version":30,"architecture":"two_agent_bounded_api_validation_v30","bid_id":bid_id,"source_pdf":pdf.name,"source_pdf_path":str(pdf),"header":parsed.get("header",{}),"product_category":product_category,"product_name":product_name,"indiamart_search_query":search_query,"office_name":office_name,"contacts":contacts,
                 "linked_spec_documents":[{"document_id":f"DOC_{i:02d}","source_document":d.get("source_document"),"local_path":d.get("local_path")} for i,d in enumerate(linked_docs,1)],
-                "n_linked_spec_documents":len(linked_docs),"n_documents_total":len(all_documents),"n_documents_extracted":len(documents),"document_triage":triage_audit,"agent1_bundle_chars":len(bundle),"agent1_approx_input_tokens":max(1,len(bundle)//4),"agent1_extraction_chunks":len(chunks),"agent1_chunk_chars_limit":args.llm_context_chars,"agent1_chunk_overlap_chars":args.chunk_overlap_chars,"n_final_constraints":len(final_constraints),"representation_flags":all_flags,"validation_status":validation_status,"validation_summary":(validation_obj or {}).get("summary",{}),"risk_summary":{"total":len(extraction_constraints),"agent2":len(risky_constraints),"auto_keep":len(safe_constraints)},"risk_audit":risk_audit,"final_constraints":final_constraints,"linked_manifest":linked_manifest,"failed_documents":failed_documents}
+                "n_linked_spec_documents":len(linked_docs),"n_documents_total":len(all_documents),"n_documents_extracted":len(documents),"document_triage":triage_audit,"agent1_bundle_chars":len(bundle),"agent1_approx_input_tokens":max(1,len(bundle)//4),"agent1_extraction_chunks":len(chunks),"agent1_chunk_chars_limit":args.llm_context_chars,"agent1_chunk_overlap_chars":args.chunk_overlap_chars,"n_final_constraints":len(final_constraints),"completeness_audit":completeness_audit,"representation_flags":all_flags,"validation_status":validation_status,"validation_summary":(validation_obj or {}).get("summary",{}),"risk_summary":{"total":len(extraction_constraints),"agent2":len(risky_constraints),"auto_keep":len(safe_constraints)},"risk_audit":risk_audit,"final_constraints":final_constraints,"linked_manifest":linked_manifest,"failed_documents":failed_documents}
         out_path.write_text(json.dumps(result,indent=2,ensure_ascii=False),encoding="utf-8")
         return bid_id,status,None
     except Exception as e:
@@ -3196,7 +3126,7 @@ async def amain(args):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="GeM bid semantic extractor v30: bounded API calls, two-agent chunking, selective OCR"
+        description="GeM bid semantic extractor v30: bounded API calls, two-agent chunking, conditional JSON repair, selective OCR"
     )
     ap.add_argument("--input_dir", type=Path, default=None)
     ap.add_argument("--output_dir", type=Path, required=True)
@@ -3214,14 +3144,13 @@ def main():
                     help="Reject prompts exceeding this token count rather than risking OOM.")
     ap.add_argument("--no_llm", action="store_true")
     ap.add_argument("--no_linked_docs", action="store_true")
-    ap.add_argument("--no_doc_triage", action="store_true", help="Disable document triage; include all linked documents.")
     ap.add_argument("--no_validator", action="store_true", help="Skip Agent 2 validation (debug only).")
     ap.add_argument("--validator_max_new_tokens", type=int, default=0, help="Validator output tokens; 0 uses --max_new_tokens.")
-    ap.add_argument("--validator_retries", type=int, default=1, help="Total attempts per validator call; 1 disables retries to prevent API-call explosions.")
+    ap.add_argument("--validator_retries", type=int, default=0, help="Legacy option; Agent 2 now makes one call without model retries.")
     ap.add_argument("--validator_evidence_chars", type=int, default=70000, help="Max targeted evidence chars per Agent-2 batch.")
     ap.add_argument("--validator_evidence_window", type=int, default=900, help="Characters around each evidence hit.")
-    ap.add_argument("--validator_batch_size", type=int, default=50, help="Agent-2 constraints per validation call. Default keeps calls bounded without recursive splitting.")
-    ap.add_argument("--validator_min_batch_size", type=int, default=5, help="Minimum batch size before a validator batch failure is recorded.")
+    ap.add_argument("--validator_batch_size", type=int, default=100000, help="Legacy option; Agent 2 now validates all routed constraints in one call.")
+    ap.add_argument("--validator_min_batch_size", type=int, default=100000, help="Legacy option; Agent 2 now validates all routed constraints in one call.")
     ap.add_argument("--validator_risk_threshold", type=int, default=3, help="Agent-2 risk score threshold; constraints below it are auto-kept.")
     ap.add_argument("--force", action="store_true", help="Reprocess bids even if a an output JSON already exists.")
     ap.add_argument(
