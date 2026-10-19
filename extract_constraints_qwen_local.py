@@ -12,7 +12,7 @@ Use --no_llm to run with zero API calls (deterministic evidence only).
     pip install pdfplumber openai tqdm pytesseract pymupdf pillow openpyxl requests
     # Tesseract is a separate system executable; install it too (Windows: UB Mannheim installer)
     # If Tesseract is installed but not on PATH (Windows): set TESSERACT_CMD to its full executable path
-    export OPENAI_API_KEY=...  OPENAI_BASE_URL=https://openrouter.ai/api/v1   # Qwen via OpenRouter
+    export OPENROUTER_API_KEY=...  OPENAI_BASE_URL=https://openrouter.ai/api/v1   # Gemma via OpenRouter
     python extract_constraints_hybrid.py --input_dir ./bid_pdfs --output_dir ./out --no_llm
     python extract_constraints_hybrid.py --input_dir ./bid_pdfs --output_dir ./out --model qwen/qwen3.8-27b:free --concurrency 1
 
@@ -1492,7 +1492,7 @@ class APIDailyBudget:
 
 
 async def call_llm(client, model, sem, prompt, max_tokens, think_mode,
-                   rate_limiter=None, api_budget=None, retries=2):
+                   rate_limiter=None, api_budget=None, retries=5):
     """
     Make an API call with explicit retry timing.
 
@@ -1598,16 +1598,35 @@ async def call_llm(client, model, sem, prompt, max_tokens, think_mode,
                 except (TypeError, ValueError):
                     pass
 
-            # Every retry delay is an 8-second multiple.
+            # Some OpenRouter upstream errors (notably Google AI Studio BYOK)
+            # put the retry delay only inside the JSON error body, e.g.
+            # details[].retryDelay="13s" or a message saying "retry in 13.4s".
+            # Read those hints as well as the HTTP Retry-After header.
+            body_text = detail
+            try:
+                parsed_body = json.loads(response_body) if isinstance(response_body, str) else response_body
+                if isinstance(parsed_body, dict):
+                    err_obj = parsed_body.get("error", parsed_body)
+                    details_list = err_obj.get("details", []) if isinstance(err_obj, dict) else []
+                    for item in details_list if isinstance(details_list, list) else []:
+                        if isinstance(item, dict) and item.get("retryDelay"):
+                            value = str(item["retryDelay"]).strip().lower().removesuffix("s")
+                            retry_after = max(retry_after or 0, float(value))
+                    message = err_obj.get("message", "") if isinstance(err_obj, dict) else ""
+                    import re as _re
+                    match = _re.search(r"retry\s+in\s+([0-9]+(?:\.[0-9]+)?)\s*s", message, _re.I)
+                    if match:
+                        retry_after = max(retry_after or 0, float(match.group(1)))
+            except (ValueError, TypeError, AttributeError):
+                pass
+
+            # Honor upstream retry timing, then add a small safety margin.
+            # For quota 429s this prevents hammering the same BYOK route.
             exponential = 8 * attempt
             wait = exponential
-
             if retry_after is not None:
-                wait = max(wait, int(retry_after + 7.999) // 8 * 8)
-
-            # Keep the backoff bounded, but still an 8-second multiple.
-            wait = min(180, wait)
-            wait = max(8, (wait // 8) * 8)
+                wait = max(wait, int(retry_after + 4.999))
+            wait = min(300, max(8, int(wait)))
 
             print(
                 f"  [API error {code}; retry {attempt + 1}/{retries} in {wait}s]",
@@ -1632,48 +1651,82 @@ class JSONRepairFailed(RuntimeError):
 
 
 def parse_llm_json(text: str):
-    """
-    Parse Qwen JSON defensively:
-      1. strict json.loads()
-      2. deterministic local json-repair
+    """Parse an LLM response as a JSON object, repairing syntax locally if needed.
 
-    json-repair only repairs serialization syntax. It has no source documents
-    and therefore cannot invent semantic requirements.
+    Models sometimes return the expected validator decisions as a top-level
+    array instead of the documented wrapper object. Arrays of decision objects
+    are normalized into the expected validator envelope without dropping items.
     """
     if not text:
         raise ValueError("empty LLM response")
 
-    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
-    text = re.sub(r"^\s*```(?:json)?\s*", "", text, flags=re.I)
-    text = re.sub(r"\s*```\s*$", "", text).strip()
+    cleaned = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
+    cleaned = re.sub(r"^\s*```(?:json)?\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s*```\s*$", "", cleaned).strip()
 
-    s = text.find("{")
-    e = text.rfind("}")
+    def require_object(value):
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, list):
+            # Agent 2 occasionally emits the decision records directly as an
+            # array. Preserve every record by wrapping the array in the schema
+            # envelope expected by validate_validator_object(). Structural
+            # validation later checks that every requested constraint is present.
+            if value and all(isinstance(item, dict) and item.get("constraint_id") is not None for item in value):
+                decisions = value
+                counts = {"input_constraints": len(decisions), "keep": 0, "correct": 0, "reject": 0}
+                for item in decisions:
+                    decision = str(item.get("decision") or "KEEP").upper().strip()
+                    key = {"KEEP": "keep", "CORRECT": "correct", "REJECT": "reject"}.get(decision)
+                    if key:
+                        counts[key] += 1
+                return {
+                    "schema_version": 1,
+                    "validation_agent": "targeted_adversarial_validator",
+                    "validation_status": "ok",
+                    "summary": counts,
+                    "validated_constraints": decisions,
+                }
+            if len(value) == 1 and isinstance(value[0], dict):
+                return value[0]
+            raise ValueError(
+                f"JSON response is an array with {len(value)} items; expected an object or an array of constraint decisions"
+            )
+        raise ValueError(f"JSON response is {type(value).__name__}; expected object")
 
+    # First parse the complete response so array wrappers are not accidentally
+    # stripped by searching for the first/last curly brace.
+    try:
+        return require_object(json.loads(cleaned))
+    except json.JSONDecodeError as initial_json_error:
+        first_error = initial_json_error
+    except ValueError as shape_error:
+        # Valid JSON but the wrong shape: let the repair path try to normalize
+        # serialization, while preserving this shape error for diagnostics.
+        first_error = shape_error
+
+    # Some models add short commentary around the JSON. Extract the outermost
+    # object only when the complete response was not parseable as JSON.
+    s = cleaned.find("{")
+    e = cleaned.rfind("}")
     if s < 0:
-        raise ValueError("no JSON object in LLM output")
+        raise ValueError(f"no JSON object in LLM output: {first_error}") from first_error
     if e < s:
         raise ValueError(
-            "LLM output appears truncated before JSON object closed"
-        )
-
-    candidate = text[s:e + 1]
+            f"LLM output appears truncated before JSON object closed: {first_error}"
+        ) from first_error
+    candidate = cleaned[s:e + 1]
 
     try:
-        return json.loads(candidate)
-    except json.JSONDecodeError as first_error:
+        return require_object(json.loads(candidate))
+    except (json.JSONDecodeError, ValueError):
         pass
 
     try:
         from json_repair import repair_json
 
         repaired = repair_json(candidate, return_objects=True)
-        if isinstance(repaired, dict):
-            return repaired
-
-        raise ValueError(
-            f"json-repair returned {type(repaired).__name__}, expected dict"
-        )
+        return require_object(repaired)
     except Exception as repair_error:
         raise ValueError(
             f"invalid JSON after local repair: {first_error}; "
@@ -2289,7 +2342,7 @@ async def run_validator_batch(client, model, sem, evidence_bundle, inputs, max_t
 
 async def validate_in_batches(client, model, sem, documents, inputs, batch_size, min_batch_size,
                               max_tokens, think_mode, rate_limiter=None, api_budget=None, retries=5,
-                              evidence_chars=70000, evidence_window=900):
+                              evidence_chars=12000, evidence_window=1000):
     if not inputs:
         return {"schema_version":30,"validation_agent":"targeted_adversarial_validator","validation_status":"ok",
                 "summary":{"input_constraints":0,"keep":0,"correct":0,"reject":0,},
@@ -2303,12 +2356,10 @@ async def validate_in_batches(client, model, sem, documents, inputs, batch_size,
                                           rate_limiter=rate_limiter,api_budget=api_budget,retries=retries)
             batch_records.append({"batch":label,"input_count":len(items),"status":"ok","evidence_chars":len(evidence)})
             all_items.extend(obj.get("validated_constraints",[])); return
-        except JSONRepairFailed:
-            raise
         except Exception as first_error:
-            # v30: never recursively split a failed Agent-2 batch. Recursive
-            # splitting was the source of dozens of extra calls on free endpoints.
-            # Fail open: preserve the Agent-1 constraints and record the failure.
+            # Fail open on malformed/truncated model JSON as well as API/validation
+            # errors. Keep Agent-1 values, record the exact failure, and continue
+            # to the next batch/bid rather than aborting the entire bid.
             reason=f"validator batch failed; original constraints retained without retry/splitting: {first_error!r}"
             batch_records.append({"batch":label,"input_count":len(items),"status":"failed_open_keep","reason":reason})
             all_items.extend(_validator_failure_audit(items,reason))
@@ -2788,11 +2839,11 @@ async def process_bid(pool, client, sem, pdf: Path, args, out_dir: Path,
             validation_status="ok"; final_constraints=extraction_constraints
             validation_audit=[{"constraint_id":str(c.get("constraint_id")),"decision":"KEEP","route":"auto_keep","reason":"low-risk explicit constraint"} for c in extraction_constraints]
         else:
-            print(f"  [AGENT2] {bid_id} | one validation call for {len(risky_constraints)}/{len(extraction_constraints)} high-risk constraints",file=sys.stderr)
+            print(f"  [AGENT2] {bid_id} | validating {len(risky_constraints)}/{len(extraction_constraints)} high-risk constraints in batches of up to {max(1, args.validator_batch_size)}",file=sys.stderr)
             validation_obj,agent2_audit=await validate_in_batches(client,args.model,sem,documents,risky_constraints,
-                batch_size=max(1, len(risky_constraints)),min_batch_size=max(1, len(risky_constraints)),
-                max_tokens=args.validator_max_new_tokens or args.max_new_tokens,think_mode=args.no_think_mode,
-                rate_limiter=rate_limiter,api_budget=api_budget,retries=1,
+                batch_size=max(1, args.validator_batch_size),min_batch_size=max(1, args.validator_min_batch_size),
+                max_tokens=args.validator_max_new_tokens or min(args.max_new_tokens, 4096),think_mode=args.no_think_mode,
+                rate_limiter=rate_limiter,api_budget=api_budget,retries=max(1, args.validator_retries),
                 evidence_chars=args.validator_evidence_chars,evidence_window=args.validator_evidence_window)
             validated_high,_=apply_validation(risky_constraints,validation_obj)
             validated_by_id={str(c.get("constraint_id")):c for c in validated_high}
@@ -3070,7 +3121,7 @@ async def amain(args):
             base_url = (
                 args.base_url
                 or os.getenv("OPENAI_BASE_URL")
-                or ("https://openrouter.ai/api/v1" if os.getenv("OPENAI_API_KEY") else "")
+                or ("https://openrouter.ai/api/v1" if (os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")) else "")
             )
             base_url_l = base_url.lower()
             if args.api_key_env:
@@ -3078,7 +3129,7 @@ async def amain(args):
                 if not api_key:
                     raise RuntimeError(f"Environment variable {args.api_key_env!r} is not set.")
             elif "openrouter.ai" in base_url_l:
-                api_key = args.api_key or os.getenv("OPENAI_API_KEY")
+                api_key = args.api_key or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
                 api_provider = "openrouter"
                 if not api_key:
                     raise RuntimeError("OpenRouter selected but no key was found. Set OPENAI_API_KEY or pass --api_key.")
@@ -3092,34 +3143,42 @@ async def amain(args):
                 client_kwargs["base_url"] = base_url
             client = AsyncOpenAI(**client_kwargs)
             print(f"[LLM] provider={api_provider} base_url={base_url or 'default'} model={args.model}", file=sys.stderr)
+            print(f"[LLM] request pacing: one request every >= {args.min_request_interval:.2f}s; application API-call cap disabled", file=sys.stderr)
 
     sem = asyncio.Semaphore(args.concurrency)
     rate_limiter = RateLimiter(args.min_request_interval) if client else None
-    api_budget = APIDailyBudget(args.api_budget_file or (args.output_dir / "api_usage.json"), args.max_api_requests) if client else None
+    # No application-level API-call cap. OpenRouter/provider quotas remain authoritative.
+    api_budget = None
     counts = {"ok": 0, "skipped": 0, "failed": 0}
     failures = []
 
+    # Strictly process one bid at a time. Each bid JSON and its supporting files
+    # are written by process_bid before the next bid begins; refresh CSVs after
+    # each bid so completed work survives interruption.
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
-        async def guarded(p):
-            return await process_bid(
-                pool, client, sem, p, args, args.output_dir, rate_limiter=rate_limiter, api_budget=api_budget
-            )
-
-        tasks = [asyncio.create_task(guarded(p)) for p in pdfs]
         try:
-            from tqdm.asyncio import tqdm_asyncio
-            it = tqdm_asyncio.as_completed(tasks, total=len(tasks))
+            from tqdm import tqdm
+            bid_iter = tqdm(pdfs, total=len(pdfs), desc="GeM bids")
         except ImportError:
-            it = asyncio.as_completed(tasks)
+            bid_iter = pdfs
 
-        for fut in it:
-            bid_id, status, fail = await fut
+        for p in bid_iter:
+            bid_id, status, fail = await process_bid(
+                pool, client, sem, p, args, args.output_dir,
+                rate_limiter=rate_limiter, api_budget=api_budget
+            )
             counts[status] += 1
             if fail:
                 failures.append(fail)
                 print(f"[{bid_id}] FAILED: {fail['error']}", file=sys.stderr)
                 if fail.get("traceback"):
                     print(fail["traceback"], file=sys.stderr)
+            # Persist roll-up tables after every bid, not only at end of dataset.
+            write_csvs(args.output_dir)
+            if failures:
+                (args.output_dir / "failures.json").write_text(
+                    json.dumps(failures, indent=2), encoding="utf-8"
+                )
 
     n_final = write_csvs(args.output_dir)
     print(
@@ -3154,35 +3213,35 @@ def main():
     ap.add_argument("--no_llm", action="store_true")
     ap.add_argument("--no_linked_docs", action="store_true")
     ap.add_argument("--no_validator", action="store_true", help="Skip Agent 2 validation (debug only).")
-    ap.add_argument("--validator_max_new_tokens", type=int, default=0, help="Validator output tokens; 0 uses --max_new_tokens.")
-    ap.add_argument("--validator_retries", type=int, default=0, help="Legacy option; Agent 2 now makes one call without model retries.")
-    ap.add_argument("--validator_evidence_chars", type=int, default=70000, help="Max targeted evidence chars per Agent-2 batch.")
-    ap.add_argument("--validator_evidence_window", type=int, default=900, help="Characters around each evidence hit.")
-    ap.add_argument("--validator_batch_size", type=int, default=100000, help="Legacy option; Agent 2 now validates all routed constraints in one call.")
-    ap.add_argument("--validator_min_batch_size", type=int, default=100000, help="Legacy option; Agent 2 now validates all routed constraints in one call.")
+    ap.add_argument("--validator_max_new_tokens", type=int, default=4096, help="Maximum Agent-2 output tokens per validation batch.")
+    ap.add_argument("--validator_retries", type=int, default=5, help="Retries for transient Agent-2 API failures; HTTP 429 honors provider retry hints.")
+    ap.add_argument("--validator_evidence_chars", type=int, default=12000, help="Maximum targeted evidence characters per Agent-2 call, aligned with Agent-1 chunk size.")
+    ap.add_argument("--validator_evidence_window", type=int, default=1000, help="Characters around each evidence hit, aligned with Agent-1 overlap scale.")
+    ap.add_argument("--validator_batch_size", type=int, default=4, help="Maximum risky constraints per Agent-2 call; evidence is separately capped by --validator_evidence_chars.")
+    ap.add_argument("--validator_min_batch_size", type=int, default=1, help="Minimum Agent-2 batch size (kept for compatibility).")
     ap.add_argument("--validator_risk_threshold", type=int, default=3, help="Agent-2 risk score threshold; constraints below it are auto-kept.")
     ap.add_argument("--force", action="store_true", help="Reprocess bids even if a an output JSON already exists.")
     ap.add_argument(
         "--base_url",
         default=os.getenv("OPENAI_BASE_URL"),
-        help="OpenAI-compatible API base URL. For Qwen on OpenRouter use https://openrouter.ai/api/v1",
+        help="OpenAI-compatible API base URL (OpenRouter default: https://openrouter.ai/api/v1).",
     )
     ap.add_argument(
         "--api_key",
-        default=os.getenv("OPENAI_API_KEY"),
-        help="API key. Prefer OPENAI_API_KEY for OpenRouter or OPENAI_API_KEY for OpenAI.",
+        default=os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY"),
+        help="OpenRouter API key (prefer OPENROUTER_API_KEY; OPENAI_API_KEY is also supported).",
     )
     ap.add_argument(
         "--api_key_env",
         default=None,
-        help="Environment variable containing the API key. Overrides automatic provider detection.",
+        help="Environment variable containing the API key, e.g. OPENROUTER_API_KEY.",
     )
-    ap.add_argument("--model", default="qwen/qwen3.8-27b:free")
+    ap.add_argument("--model", default="google/gemma-4-26b-a4b-it:free")
     ap.add_argument("--concurrency", type=int, default=1)
-    ap.add_argument("--min_request_interval", type=float, default=8.0,
-                    help="Minimum seconds between API requests. Use 8+ for rate-limited/free endpoints.")
-    ap.add_argument("--max_api_requests", type=int, default=45,
-                help="Hard cap on HTTP API attempts per UTC day for this output directory. Default 45 leaves headroom under a 50/day quota.")
+    ap.add_argument("--min_request_interval", type=float, default=15.0,
+                    help="Minimum seconds between ALL API calls. The default is conservative for providers with a 16k input-token/minute quota; adjust only after confirming the selected route quota.")
+    ap.add_argument("--max_api_requests", type=int, default=0,
+                help="Deprecated. 0 disables the old local API-call cap; provider quotas still apply.")
     ap.add_argument("--api_budget_file", type=Path, default=None,
                 help="Optional persistent API budget state file. Defaults to <output_dir>/api_usage.json.")
     ap.add_argument("--workers", type=int, default=1)
@@ -3191,12 +3250,12 @@ def main():
         help="Maximum Qwen output tokens for each complete retrace."
     )
     ap.add_argument(
-        "--llm_context_chars", type=int, default=120000,
-        help="Maximum chars per Agent-1 extraction call. If the complete bid exceeds this, it is split into document-aware overlapping chunks; no document text is discarded."
+        "--llm_context_chars", type=int, default=12000,
+        help="Maximum chars per Agent-1 extraction call. Smaller chunks reduce input-token bursts on low-quota provider routes; all document text is represented across chunks."
     )
     ap.add_argument(
-        "--chunk_overlap_chars", type=int, default=5000,
-        help="Overlap between adjacent chunks of an oversized document. Helps preserve tables/specifications crossing chunk boundaries."
+        "--chunk_overlap_chars", type=int, default=1000,
+        help="Overlap between adjacent chunks of an oversized document. Keep modest to avoid repeatedly consuming large input-token budgets."
     )
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument(
